@@ -7,22 +7,28 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
-    ConversationHandler, # اضافه شده برای مکالمه
+    ConversationHandler,
 )
 
-# توکن ربات خود را اینجا قرار دهید
+# --- توکن و تنظیمات ---
+# توکن شما از @BotFather
 TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbJcZ3LnqcymMRYf8"
+# توجه: برای اجرای روی سرور Railway نیازی به تنظیم پراکسی نیست.
 
-
-# فعال کردن لاگینگ برای خطایابی
+# --- فعال کردن لاگینگ ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- تعریف حالت‌های مکالمه برای افزودن کتاب ---
+# --- تعریف حالت‌های مکالمه ---
+# برای افزودن کتاب
 GET_TITLE, GET_AUTHOR, GET_SUBJECT, GET_COUNT = range(4)
+# برای جستجوی کتاب
+SEARCH_QUERY = 4
+# برای ویرایش موجودی (جدید)
+EDIT_GET_ID, EDIT_GET_NEW_COUNT = range(5, 7)
 
 
 # --- توابع کمکی دیتابیس ---
@@ -31,6 +37,7 @@ def db_query(query, params=()):
     """یک تابع کمکی برای اتصال و اجرای کوئری در دیتابیس"""
     conn = None
     try:
+        # دیتابیس در کنار فایل ربات روی سرور ساخته می‌شود
         conn = sqlite3.connect('library.db', check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute(query, params)
@@ -50,25 +57,37 @@ def db_query(query, params=()):
             conn.close()
 
 def init_db():
-    """ایجاد جداول مورد نیاز در صورت عدم وجود"""
+    """ایجاد جداول مورد نیاز و به‌روزرسانی ساختار جدول books"""
     logger.info("در حال بررسی و ایجاد جداول دیتابیس...")
-    # جدول books برای نگهداری مشخصات کتاب‌ها
+    
+    # ایجاد جدول books
     db_query("""
         CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
             author TEXT,
             subject TEXT,
-            count INTEGER NOT NULL
+            count INTEGER NOT NULL, 
+            borrowed_count INTEGER DEFAULT 0 
         )
     """)
-    # جدول admins برای نگهداری user_id مدیران
+    
+    # تلاش برای اضافه کردن ستون borrowed_count در صورت عدم وجود (برای جلوگیری از خطا در دیپلوی مجدد)
+    try:
+        # این کوئری فقط اگر ستون وجود نداشته باشد، آن را اضافه می‌کند.
+        db_query("ALTER TABLE books ADD COLUMN borrowed_count INTEGER DEFAULT 0")
+    except sqlite3.Error as e:
+        if "duplicate column name" in str(e):
+            pass # ستون از قبل وجود داشته، مشکلی نیست
+        else:
+            logger.error(f"خطا در اضافه کردن ستون borrowed_count: {e}")
+
+    # ایجاد جدول admins
     db_query("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY
         )
     """)
-    # اگر هیچ ادمینی وجود ندارد، اولین کاربری که ربات را اجرا می‌کند ادمین خواهد بود
     if not db_query("SELECT 1 FROM admins LIMIT 1"):
         logger.warning("جدول ادمین خالی است. اولین کاربری که /start را بزند، ادمین خواهد شد.")
 
@@ -78,218 +97,283 @@ def is_admin(user_id):
     result = db_query(query, (user_id,))
     return bool(result)
 
-# --- Handlers عمومی ---
+# --- Handlers عمومی و ناوبری ---
+
+def get_keyboard(user_id):
+    """ساخت کیبورد بر اساس نقش کاربر (دکمه ویرایش موجودی اضافه شد)"""
+    if is_admin(user_id):
+        return ReplyKeyboardMarkup([
+            ['📚 افزودن کتاب', '🔍 جستجوی کتاب'],
+            ['✏️ ویرایش موجودی', '📦 لیست درخواست‌ها'], 
+            # ['📊 آمار']
+        ], resize_keyboard=True, one_time_keyboard=False)
+    else:
+        return ReplyKeyboardMarkup([
+            ['🔍 جستجوی کتاب', '🏷 فیلتر موضوعی'],
+            ['📕 کتاب‌های من']
+        ], resize_keyboard=True, one_time_keyboard=False)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """دستور /start را مدیریت می‌کند"""
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name
     
-    # اگر ادمین اولیه تعریف نشده باشد، کاربر فعلی را ادمین می‌کند
+    # ادمین اولیه
     if not db_query("SELECT 1 FROM admins LIMIT 1"):
         db_query("INSERT INTO admins (user_id) VALUES (?)", (user_id,))
         logger.warning(f"کاربر {user_id} ({first_name}) به عنوان اولین ادمین ثبت شد.")
         
     welcome_text = f"سلام {first_name}، به ربات کتابخانه خوابگاه خوش آمدید!\n"
-    
     if is_admin(user_id):
         welcome_text += "شما به پنل ادمین دسترسی دارید."
-        keyboard = [
-            ['📚 افزودن کتاب', '🔍 جستجوی کتاب'],
-            ['📦 لیست درخواست‌ها', '📊 آمار']
-        ]
-    else:
-        welcome_text += "می‌توانید از دکمه‌های زیر استفاده کنید:"
-        keyboard = [
-            ['🔍 جستجوی کتاب', '🏷 فیلتر موضوعی'],
-            ['📕 کتاب‌های من']
-        ]
-        
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    await update.message.reply_text(welcome_text, reply_markup=get_keyboard(user_id))
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """لغو مکالمه و بازگشت به منوی اصلی"""
+    context.user_data.clear()
+    
+    await update.message.reply_text(
+        "❌ عملیات لغو شد. به منوی اصلی بازگشتید.", 
+        reply_markup=get_keyboard(update.effective_user.id)
+    )
+    
+    return ConversationHandler.END
 
 
-# --- Handlers مربوط به افزودن کتاب (ConversationHandler) ---
-
+# --- (بخش ۱) Handlers مربوط به افزودن کتاب ---
 async def add_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند افزودن کتاب (فقط برای ادمین‌ها)"""
     user_id = update.effective_user.id
-    
-    # فیلتر ادمین: اگر ادمین نیست، اجازه شروع نده
     if not is_admin(user_id):
-        await update.message.reply_text("شما اجازه دسترسی به این بخش را ندارید.")
+        await update.message.reply_text("شما اجازه دسترسی به این بخش را ندارید.", reply_markup=get_keyboard(user_id))
+        return ConversationHandler.END
+    context.user_data['book_data'] = {}
+    cancel_keyboard = [['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("📚 لطفا **نام کامل کتاب** را وارد کنید:", reply_markup=reply_markup)
+    return GET_TITLE
+async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت نام کتاب و درخواست نویسنده"""
+    context.user_data['book_data']['title'] = update.message.text
+    await update.message.reply_text("✍️ حالا لطفا **نام نویسنده** را وارد کنید:")
+    return GET_AUTHOR
+async def get_author(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت نام نویسنده و درخواست موضوع"""
+    context.user_data['book_data']['author'] = update.message.text
+    subject_keyboard = [['داستان', 'علمی-تخیلی', 'روانشناسی'], ['تاریخی', 'درسی', 'سایر'], ['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(subject_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("🏷 لطفا **موضوع کتاب** را انتخاب کنید یا وارد نمایید:", reply_markup=reply_markup)
+    return GET_SUBJECT
+async def get_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت موضوع کتاب و درخواست تعداد موجودی"""
+    context.user_data['book_data']['subject'] = update.message.text
+    await update.message.reply_text("🔢 در نهایت، لطفا **تعداد کل موجودی** این کتاب را وارد کنید (عدد):", reply_markup=ReplyKeyboardRemove())
+    return GET_COUNT
+async def get_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت موجودی، ذخیره در دیتابیس و پایان مکالمه"""
+    try:
+        count = int(update.message.text)
+        if count < 1: raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ خطا: موجودی باید یک عدد صحیح و بزرگتر از صفر باشد. لطفا دوباره وارد کنید:", reply_markup=ReplyKeyboardRemove())
+        return GET_COUNT 
+    book_data = context.user_data['book_data']
+    query = "INSERT INTO books (title, author, subject, count) VALUES (?, ?, ?, ?)"
+    params = (book_data['title'], book_data['author'], book_data['subject'], count)
+    last_id = db_query(query, params)
+    if last_id is not None:
+        await update.message.reply_text(f"✅ کتاب **{book_data['title']}** (ID: {last_id}) با موفقیت اضافه شد.", reply_markup=get_keyboard(update.effective_user.id))
+    else:
+        await update.message.reply_text("❌ خطایی در ذخیره اطلاعات رخ داد.", reply_markup=get_keyboard(update.effective_user.id))
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# --- (بخش ۲) Handlers مربوط به جستجوی کتاب (جدید) ---
+async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند جستجوی کتاب"""
+    cancel_keyboard = [['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("🔍 لطفا **نام کتاب، نویسنده یا موضوع** مورد نظر خود را برای جستجو وارد کنید:", reply_markup=reply_markup)
+    return SEARCH_QUERY
+
+async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت کوئری جستجو و اجرای کوئری در دیتابیس"""
+    query_text = update.message.text
+    search_term = f'%{query_text}%'
+    
+    sql_query = """
+        SELECT id, title, author, subject, count, borrowed_count FROM books 
+        WHERE title LIKE ? OR author LIKE ? OR subject LIKE ?
+        LIMIT 10
+    """
+    
+    results = db_query(sql_query, (search_term, search_term, search_term))
+    
+    if results:
+        response_text = f"✅ {len(results)} کتاب با عبارت **'{query_text}'** پیدا شد:\n\n"
+        
+        for book_id, title, author, subject, count, borrowed in results:
+            available = count - (borrowed or 0) # موجودی موجود = کل - قرض گرفته شده
+            response_text += (
+                f"**📕 {title}**\n"
+                f"    🆔: {book_id}\n"
+                f"    ✍️: {author}\n"
+                f"    🏷: {subject}\n"
+                f"    ⬅️ موجودی: {available} (از کل {count} عدد)\n"
+                f"---------------------------------\n"
+            )
+    else:
+        response_text = f"❌ متأسفانه کتابی با عبارت **'{query_text}'** پیدا نشد."
+
+    await update.message.reply_text(
+        response_text,
+        reply_markup=get_keyboard(update.effective_user.id)
+    )
+    
+    return ConversationHandler.END
+
+
+# --- (بخش ۳) Handlers مربوط به ویرایش موجودی (جدید) ---
+
+async def edit_count_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند ویرایش موجودی (فقط ادمین)"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("شما اجازه دسترسی به این بخش را ندارید.", reply_markup=get_keyboard(user_id))
         return ConversationHandler.END
 
-    # تنظیمات موقت: ContextTypes.user_data برای ذخیره موقت اطلاعات
-    context.user_data['book_data'] = {}
-    
-    # دکمه لغو را برای کاربر نمایش می‌دهیم
     cancel_keyboard = [['لغو عملیات']]
     reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
     
     await update.message.reply_text(
-        "📚 لطفا **نام کامل کتاب** را وارد کنید:",
+        "✏️ لطفا **ID کتاب**ی که می‌خواهید موجودی آن را ویرایش کنید، وارد نمایید.\n"
+        "(ID را می‌توانید از '🔍 جستجوی کتاب' پیدا کنید)",
         reply_markup=reply_markup
     )
-    
-    # به حالت بعدی (دریافت عنوان) می‌رویم
-    return GET_TITLE
+    return EDIT_GET_ID
 
-async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """دریافت نام کتاب و درخواست نویسنده"""
-    title = update.message.text
-    context.user_data['book_data']['title'] = title
-    
-    await update.message.reply_text(f"نام کتاب: **{title}** ثبت شد.\n\n✍️ حالا لطفا **نام نویسنده** را وارد کنید:")
-    
-    # به حالت بعدی (دریافت نویسنده) می‌رویم
-    return GET_AUTHOR
-
-async def get_author(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """دریافت نام نویسنده و درخواست موضوع"""
-    author = update.message.text
-    context.user_data['book_data']['author'] = author
-    
-    # می‌توانیم موضوعات رایج را به عنوان دکمه پیشنهاد دهیم
-    subject_keyboard = [
-        ['داستان', 'علمی-تخیلی', 'روانشناسی'],
-        ['تاریخی', 'درسی', 'سایر'],
-        ['لغو عملیات']
-    ]
-    reply_markup = ReplyKeyboardMarkup(subject_keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        f"نویسنده: **{author}** ثبت شد.\n\n🏷 لطفا **موضوع کتاب** را انتخاب کنید یا وارد نمایید:",
-        reply_markup=reply_markup
-    )
-    
-    # به حالت بعدی (دریافت موضوع) می‌رویم
-    return GET_SUBJECT
-
-async def get_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """دریافت موضوع کتاب و درخواست تعداد موجودی"""
-    subject = update.message.text
-    context.user_data['book_data']['subject'] = subject
-    
-    await update.message.reply_text(f"موضوع: **{subject}** ثبت شد.\n\n🔢 در نهایت، لطفا **تعداد موجودی** این کتاب در انبار را وارد کنید (باید یک عدد باشد):",
-                                    reply_markup=ReplyKeyboardRemove())
-    
-    # به حالت بعدی (دریافت موجودی) می‌رویم
-    return GET_COUNT
-
-async def get_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """دریافت موجودی، ذخیره در دیتابیس و پایان مکالمه"""
-    count_text = update.message.text
-    
-    # اعتبارسنجی: بررسی کنیم آیا ورودی عدد است
+async def get_book_id_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت ID و درخواست موجودی جدید"""
     try:
-        count = int(count_text)
-        if count < 1:
-             raise ValueError
+        book_id = int(update.message.text)
     except (ValueError, TypeError):
-        await update.message.reply_text("⚠️ خطا: موجودی باید یک عدد صحیح و بزرگتر از صفر باشد. لطفا دوباره وارد کنید:",
-                                        reply_markup=ReplyKeyboardRemove())
-        return GET_COUNT # در همین حالت باقی می‌مانیم تا ورودی صحیح داده شود
+        await update.message.reply_text("⚠️ خطا: ID باید یک عدد باشد. لطفا دوباره ID کتاب را وارد کنید:")
+        return EDIT_GET_ID
 
-    book_data = context.user_data['book_data']
+    # کتاب را پیدا کن
+    book = db_query("SELECT title, count, borrowed_count FROM books WHERE id = ?", (book_id,))
+    if not book:
+        await update.message.reply_text(f"⚠️ خطا: کتابی با ID {book_id} پیدا نشد. لطفا دوباره ID را وارد کنید:")
+        return EDIT_GET_ID
+
+    # ذخیره ID برای مرحله بعد
+    context.user_data['edit_book_id'] = book_id
+    title, current_count, borrowed_count = book[0]
+
+    await update.message.reply_text(
+        f"کتاب: **{title}** (ID: {book_id})\n"
+        f"موجودی فعلی (کل): {current_count}\n"
+        f"تعداد قرض گرفته شده: {borrowed_count}\n\n"
+        f"🔢 لطفا **موجودی کل جدید** را وارد کنید.\n"
+        f"(توجه: این عدد باید بزرگتر یا مساوی با تعداد قرض گرفته شده ({borrowed_count}) باشد):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return EDIT_GET_NEW_COUNT
+
+async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت موجودی جدید و آپدیت دیتابیس"""
+    try:
+        new_count = int(update.message.text)
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ خطا: موجودی باید یک عدد صحیح باشد. لطفا دوباره وارد کنید:")
+        return EDIT_GET_NEW_COUNT
+
+    book_id = context.user_data['edit_book_id']
     
-    # ذخیره در دیتابیس
-    query = "INSERT INTO books (title, author, subject, count) VALUES (?, ?, ?, ?)"
-    params = (book_data['title'], book_data['author'], book_data['subject'], count)
-    last_id = db_query(query, params)
+    # اعتبارسنجی: موجودی کل جدید نباید کمتر از تعداد قرض گرفته شده باشد
+    book_info = db_query("SELECT title, borrowed_count FROM books WHERE id = ?", (book_id,))
+    title, borrowed_count = book_info[0] if book_info else ("N/A", 0)
     
-    if last_id is not None:
+    if new_count < borrowed_count:
         await update.message.reply_text(
-            f"✅ کتاب **{book_data['title']}** (ID: {last_id}) با موفقیت به کتابخانه اضافه شد.\n"
-            f"نویسنده: {book_data['author']}، موضوع: {book_data['subject']}، موجودی: {count}",
-            reply_markup=ReplyKeyboardMarkup([
-                ['📚 افزودن کتاب', '🔍 جستجوی کتاب'],
-                ['📦 لیست درخواست‌ها', '📊 آمار']
-            ], resize_keyboard=True)
-        )
-    else:
-        await update.message.reply_text(
-            "❌ متاسفانه خطایی در ذخیره اطلاعات در دیتابیس رخ داد.",
+            f"❌ خطا: موجودی کل جدید ({new_count}) نمی‌تواند کمتر از تعداد کتاب‌های قرض گرفته شده ({borrowed_count}) باشد.\n"
+            f"لطفا یک عدد بزرگتر یا مساوی {borrowed_count} وارد کنید:",
             reply_markup=ReplyKeyboardRemove()
         )
+        return EDIT_GET_NEW_COUNT
+
+    # آپدیت دیتابیس
+    db_query("UPDATE books SET count = ? WHERE id = ?", (new_count, book_id))
     
-    # پاک کردن داده‌های موقت و پایان مکالمه
-    context.user_data.pop('book_data', None)
+    await update.message.reply_text(
+        f"✅ موجودی کل کتاب **{title}** (ID: {book_id}) با موفقیت به **{new_count}** عدد تغییر یافت.",
+        reply_markup=get_keyboard(update.effective_user.id)
+    )
+    
+    context.user_data.clear()
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """لغو مکالمه و بازگشت به منوی اصلی"""
-    context.user_data.pop('book_data', None)
-    
-    # کیبورد ادمین را دوباره نمایش می‌دهیم
-    keyboard = [
-        ['📚 افزودن کتاب', '🔍 جستجوی کتاب'],
-        ['📦 لیست درخواست‌ها', '📊 آمار']
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text("❌ عملیات افزودن کتاب لغو شد. به منوی اصلی بازگشتید.", 
-                                    reply_markup=reply_markup)
-    
-    return ConversationHandler.END
 
+# --- تابع اصلی ---
 
 def main() -> None:
     """تابع اصلی راه‌اندازی ربات"""
     
-    # 1. مطمئن شدن از وجود جداول
+    # ۱. اطمینان از وجود جداول دیتابیس
     init_db() 
     
-    if TOKEN == "YOUR_TOKEN_HERE":
-        logger.error("!!! توکن ربات تنظیم نشده است!")
-        return
-
-    # # ساخت کلاینت httpx با تنظیمات پراکسی (در صورت وجود)
-    # httpx_options = {}
-    # if PROXY_URL:
-    #     # اگر پراکسی تعیین شده، آن را به عنوان آرگومان به httpx می‌دهیم
-    #     httpx_options["proxy"] = PROXY_URL
-    #     logger.info(f"استفاده از پراکسی: {PROXY_URL}")
-        
+    # ۲. ساخت Application
     logger.info("در حال ساخت Application...")
     
-    # ساخت Application و تزریق تنظیمات httpx
-    application = Application.builder()\
-        .token(TOKEN)\
-        .concurrent_updates(True)\
-        .build()
-        # .httpx_request_kwargs(httpx_options)\
-
+    application_builder = Application.builder().token(TOKEN).concurrent_updates(True)
+    application = application_builder.build()
 
     # --- تنظیمات Handlers ---
     
-    # 1. Handler دستور /start
-    application.add_handler(CommandHandler("start", start))
-    
-    # 2. Handler افزودن کتاب (ConversationHandler)
+    # ۱. مکالمه افزودن کتاب
     add_book_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex('^📚 افزودن کتاب$'), add_book_start)
-        ],
+        entry_points=[MessageHandler(filters.Regex('^📚 افزودن کتاب$'), add_book_start)],
         states={
             GET_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), get_title)],
             GET_AUTHOR: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), get_author)],
             GET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), get_subject)],
             GET_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), get_count)],
         },
-        fallbacks=[
-            MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)
-        ]
+        fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
+
+    # ۲. مکالمه جستجوی کتاب
+    search_book_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^🔍 جستجوی کتاب$'), search_start)],
+        states={
+            SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), execute_search)],
+        },
+        fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
+    )
+
+    # ۳. مکالمه ویرایش موجودی
+    edit_count_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^✏️ ویرایش موجودی$'), edit_count_start)],
+        states={
+            EDIT_GET_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), get_book_id_for_edit)],
+            EDIT_GET_NEW_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), get_new_count)],
+        },
+        fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
+    )
+
+    # افزودن تمام Handler ها به ربات
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(add_book_handler)
+    application.add_handler(search_book_handler)    
+    application.add_handler(edit_count_handler)     
     
-    # 3. Handler برای پیام‌های ناشناخته
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start)) # فعلاً کاربر را به منوی اصلی هدایت می‌کند
+    # Handler برای پیام‌های ناشناخته 
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
     
+    # --- راه‌اندازی ربات ---
     logger.info("ربات در حال راه‌اندازی است (Polling)...")
-    
-    # اجرای ربات
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
