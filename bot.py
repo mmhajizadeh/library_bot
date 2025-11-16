@@ -12,10 +12,7 @@ from telegram.ext import (
 )
 
 # --- توکن و تنظیمات ---
-# توکن شما از @BotFather
-TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbJcZ3LnqcymMRYf8"
-
-# آدرس دیتابیس PostgreSQL که توسط Railway به عنوان یک متغیر محیطی تزریق می شود
+TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbC7LnqcymMRYf8"
 DATABASE_URL = os.environ.get('DATABASE_URL') 
 if not DATABASE_URL:
     logging.error("DATABASE_URL پیدا نشد. لطفا سرویس PostgreSQL را به پروژه متصل کنید.")
@@ -33,21 +30,21 @@ logger = logging.getLogger(__name__)
 GET_TITLE, GET_AUTHOR, GET_SUBJECT, GET_COUNT = range(4)
 # برای جستجوی کتاب
 SEARCH_QUERY = 4
-# برای ویرایش موجودی (جدید)
+# برای ویرایش موجودی
 EDIT_GET_ID, EDIT_GET_NEW_COUNT = range(5, 7)
+# برای امانت کتاب
+BORROW_GET_ID = 7
 
 
-# --- توابع کمکی دیتابیس (تغییر یافته برای PostgreSQL) ---
+# --- توابع کمکی دیتابیس ---
 
 def db_query(query, params=()):
     """یک تابع کمکی برای اتصال و اجرای کوئری در دیتابیس PostgreSQL"""
     conn = None
     try:
-        # اتصال به PostgreSQL با استفاده از متغیر محیطی
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         
-        # در PostgreSQL از %s به جای ? استفاده می شود
         cursor.execute(query, params)
         
         if query.strip().upper().startswith("SELECT"):
@@ -55,10 +52,6 @@ def db_query(query, params=()):
             return results
         else:
             conn.commit()
-            # در PostgreSQL، برای گرفتن آخرین ID از متد جداگانه استفاده می کنیم
-            if query.strip().upper().startswith("INSERT"):
-                # فرض می کنیم INSERT همیشه یک ID برمی گرداند
-                return "COMMIT_OK" 
             return "COMMIT_OK"
             
     except psycopg2.Error as e:
@@ -74,9 +67,8 @@ def init_db():
     """ایجاد جداول مورد نیاز برای PostgreSQL"""
     logger.info("در حال بررسی و ایجاد جداول دیتابیس PostgreSQL...")
     
-    # کوئری ها باید برای سینتکس PostgreSQL بهینه شوند
+    # اطمینان از وجود تمام جداول
     
-    # ۱. ایجاد جدول books (استفاده از SERIAL PRIMARY KEY به جای INTEGER PRIMARY KEY)
     db_query("""
         CREATE TABLE IF NOT EXISTS books (
             id SERIAL PRIMARY KEY,
@@ -88,20 +80,28 @@ def init_db():
         )
     """)
 
-    # ۲. ایجاد جدول admins (user_id باید BIGINT باشد تا ID تلگرام را نگه دارد)
     db_query("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id BIGINT PRIMARY KEY
         )
     """)
     
-    # ۳. بررسی ادمین اولیه
+    db_query("""
+        CREATE TABLE IF NOT EXISTS loans (
+            id SERIAL PRIMARY KEY,
+            book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
+            user_id BIGINT NOT NULL,
+            borrow_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            return_date TIMESTAMP DEFAULT NULL
+        )
+    """)
+    
+    # بررسی ادمین اولیه - اگر در این مرحله جدول خالی باشد، کاربر اول را ادمین می‌کند (مثل قبل)
     if not db_query("SELECT 1 FROM admins LIMIT 1"):
-        logger.warning("جدول ادمین خالی است.")
+        logger.warning("جدول ادمین خالی است. اولین کاربر /start ادمین خواهد شد.")
         
 def is_admin(user_id):
     """چک می‌کند آیا کاربر ادمین است یا خیر"""
-    # در PostgreSQL از %s برای placeholder استفاده می کنیم
     query = "SELECT 1 FROM admins WHERE user_id = %s"
     result = db_query(query, (user_id,))
     return bool(result)
@@ -109,17 +109,16 @@ def is_admin(user_id):
 # --- Handlers عمومی و ناوبری ---
 
 def get_keyboard(user_id):
-    """ساخت کیبورد بر اساس نقش کاربر (دکمه ویرایش موجودی اضافه شد)"""
+    """ساخت کیبورد بر اساس نقش کاربر"""
     if is_admin(user_id):
         return ReplyKeyboardMarkup([
             ['📚 افزودن کتاب', '🔍 جستجوی کتاب'],
             ['✏️ ویرایش موجودی', '📦 لیست درخواست‌ها'], 
-            # ['📊 آمار']
         ], resize_keyboard=True, one_time_keyboard=False)
     else:
         return ReplyKeyboardMarkup([
-            ['🔍 جستجوی کتاب', '🏷 فیلتر موضوعی'],
-            ['📕 کتاب‌های من']
+            ['🔍 جستجوی کتاب', '🤝 امانت کتاب'], 
+            ['🏷 فیلتر موضوعی', '📕 کتاب‌های من']
         ], resize_keyboard=True, one_time_keyboard=False)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -127,18 +126,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name
     
-    # ادمین اولیه
-    if not db_query("SELECT 1 FROM admins LIMIT 1"):
-        # در PostgreSQL، استفاده از %s ضروری است
-        db_query("INSERT INTO admins (user_id) VALUES (%s)", (user_id,))
-        logger.warning(f"کاربر {user_id} ({first_name}) به عنوان اولین ادمین ثبت شد.")
-        
-    welcome_text = f"سلام {first_name}، به ربات کتابخانه خوابگاه خوش آمدید!\n"
-    if is_admin(user_id):
-        welcome_text += "شما به پنل ادمین دسترسی دارید."
+    welcome_text = f"سلام {first_name}، به ربات کتابخانه خوش آمدید!\n"
     
+    if not is_admin(user_id) and not db_query("SELECT 1 FROM admins LIMIT 1"):
+        # اگر جدول ادمین کاملا خالی بود، این کاربر را ادمین کنید
+        db_query("INSERT INTO admins (user_id) VALUES (%s)", (user_id,))
+        welcome_text += "شما به عنوان **اولین ادمین** ثبت شدید. به پنل ادمین دسترسی دارید."
+    elif is_admin(user_id):
+        welcome_text += "شما به پنل ادمین دسترسی دارید."
+    else:
+        welcome_text += "شما به عنوان کاربر عادی وارد شدید."
+
     await update.message.reply_text(welcome_text, reply_markup=get_keyboard(user_id))
 
+async def add_admin_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """دستور /addadmin را مدیریت می‌کند و ID عددی کاربر را برمی‌گرداند."""
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        f"✅ شناسه عددی (User ID) شما: `{user_id}`\n\n"
+        "اگر می‌خواهید ادمین شوید، باید این ID را به صورت دستی در جدول `admins` دیتابیس PostgreSQL وارد کنید.",
+        parse_mode='Markdown'
+    )
+    
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """لغو مکالمه و بازگشت به منوی اصلی"""
     context.user_data.clear()
@@ -190,11 +199,9 @@ async def get_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return GET_COUNT 
     book_data = context.user_data['book_data']
     
-    # کوئری PostgreSQL با %s و RETURNING id برای گرفتن ID کتاب
     query = "INSERT INTO books (title, author, subject, count) VALUES (%s, %s, %s, %s) RETURNING id"
     params = (book_data['title'], book_data['author'], book_data['subject'], count)
     
-    # اجرای کوئری و گرفتن ID
     conn = None
     last_id = None
     try:
@@ -231,21 +238,19 @@ async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query_text = update.message.text
     search_term = f'%{query_text}%'
     
-    # PostgreSQL: از ILIKE برای جستجوی Case-Insensitive استفاده می کنیم
     sql_query = """
         SELECT id, title, author, subject, count, borrowed_count FROM books 
         WHERE title ILIKE %s OR author ILIKE %s OR subject ILIKE %s
         LIMIT 10
     """
     
-    # توجه: درایور psycopg2 یک Tuple از پارامترها را انتظار دارد
     results = db_query(sql_query, (search_term, search_term, search_term))
     
     if results:
         response_text = f"✅ {len(results)} کتاب با عبارت **'{query_text}'** پیدا شد:\n\n"
         
         for book_id, title, author, subject, count, borrowed in results:
-            available = count - (borrowed or 0) # موجودی موجود = کل - قرض گرفته شده
+            available = count - (borrowed or 0) 
             response_text += (
                 f"**📕 {title}**\n"
                 f"    🆔: {book_id}\n"
@@ -265,7 +270,7 @@ async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
-# --- (بخش ۳) Handlers مربوط به ویرایش موجودی (جدید) ---
+# --- (بخش ۳) Handlers مربوط به ویرایش موجودی ---
 
 async def edit_count_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند ویرایش موجودی (فقط ادمین)"""
@@ -292,13 +297,11 @@ async def get_book_id_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("⚠️ خطا: ID باید یک عدد باشد. لطفا دوباره ID کتاب را وارد کنید:")
         return EDIT_GET_ID
 
-    # کتاب را پیدا کن
     book = db_query("SELECT title, count, borrowed_count FROM books WHERE id = %s", (book_id,))
     if not book:
         await update.message.reply_text(f"⚠️ خطا: کتابی با ID {book_id} پیدا نشد. لطفا دوباره ID را وارد کنید:")
         return EDIT_GET_ID
 
-    # ذخیره ID برای مرحله بعد
     context.user_data['edit_book_id'] = book_id
     title, current_count, borrowed_count = book[0]
 
@@ -322,7 +325,6 @@ async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     book_id = context.user_data['edit_book_id']
     
-    # اعتبارسنجی: موجودی کل جدید نباید کمتر از تعداد قرض گرفته شده باشد
     book_info = db_query("SELECT title, borrowed_count FROM books WHERE id = %s", (book_id,))
     title, borrowed_count = book_info[0] if book_info else ("N/A", 0)
     
@@ -334,7 +336,6 @@ async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return EDIT_GET_NEW_COUNT
 
-    # آپدیت دیتابیس (با %s)
     db_query("UPDATE books SET count = %s WHERE id = %s", (new_count, book_id))
     
     await update.message.reply_text(
@@ -346,15 +347,98 @@ async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
+# --- (بخش ۴) Handlers مربوط به امانت کتاب ---
+
+async def borrow_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند امانت کتاب"""
+    cancel_keyboard = [['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "🤝 لطفا **ID کتابی** که می‌خواهید امانت بگیرید را وارد کنید.\n"
+        "(ID را از قسمت '🔍 جستجوی کتاب' پیدا کنید.)",
+        reply_markup=reply_markup
+    )
+    return BORROW_GET_ID
+
+async def process_borrow_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """بررسی ID و ثبت امانت کتاب"""
+    user_id = update.effective_user.id
+    
+    try:
+        book_id = int(update.message.text)
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ خطا: ID کتاب باید یک عدد باشد. لطفا دوباره وارد کنید:")
+        return BORROW_GET_ID
+    
+    # 1. بازیابی اطلاعات کتاب و بررسی موجودی
+    book_info = db_query("SELECT title, count, borrowed_count FROM books WHERE id = %s", (book_id,))
+    
+    if not book_info:
+        await update.message.reply_text(f"⚠️ خطا: کتابی با ID {book_id} پیدا نشد. لطفا ID صحیح را وارد کنید:")
+        return BORROW_GET_ID
+        
+    title, total_count, borrowed_count = book_info[0]
+    available_count = total_count - borrowed_count
+    
+    if available_count <= 0:
+        await update.message.reply_text(f"❌ متأسفانه کتاب **{title}** (ID: {book_id}) در حال حاضر موجود نیست.", reply_markup=get_keyboard(user_id))
+        return ConversationHandler.END
+
+    # 2. بررسی اینکه آیا کاربر قبلاً این کتاب را امانت نگرفته است
+    # فقط به دنبال وام‌های فعال (return_date IS NULL) می‌گردیم
+    loan_check_query = """
+        SELECT id FROM loans 
+        WHERE user_id = %s AND book_id = %s AND return_date IS NULL
+    """
+    existing_loan = db_query(loan_check_query, (user_id, book_id))
+    
+    if existing_loan:
+        await update.message.reply_text(
+            f"❌ شما قبلاً کتاب **{title}** را امانت گرفته‌اید و آن را برنگردانده‌اید.", 
+            reply_markup=get_keyboard(user_id)
+        )
+        return ConversationHandler.END
+    
+    # 3. ثبت امانت و به روز رسانی موجودی در یک تراکنش
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        # A. ثبت ردیف جدید در جدول loans
+        insert_loan_query = "INSERT INTO loans (book_id, user_id) VALUES (%s, %s)"
+        cursor.execute(insert_loan_query, (book_id, user_id))
+        
+        # B. افزایش borrowed_count در جدول books
+        update_book_query = "UPDATE books SET borrowed_count = borrowed_count + 1 WHERE id = %s"
+        cursor.execute(update_book_query, (book_id,))
+        
+        conn.commit()
+        
+        await update.message.reply_text(
+            f"✅ کتاب **{title}** (ID: {book_id}) با موفقیت برای شما امانت گرفته شد.\n"
+            f"موجودی در دسترس باقیمانده: **{available_count - 1}**",
+            reply_markup=get_keyboard(user_id)
+        )
+        
+    except psycopg2.Error as e:
+        logger.error(f"خطا در ثبت امانت (Transaction Failed): {e}")
+        if conn: conn.rollback()
+        await update.message.reply_text("❌ خطایی در ثبت امانت رخ داد. لطفا دوباره تلاش کنید.", reply_markup=get_keyboard(user_id))
+        
+    finally:
+        if conn: conn.close()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+
 # --- تابع اصلی ---
 
 def main() -> None:
     """تابع اصلی راه‌اندازی ربات"""
     
-    # ۱. اطمینان از وجود جداول دیتابیس
     init_db() 
     
-    # ۲. ساخت Application
     logger.info("در حال ساخت Application...")
     
     application_builder = Application.builder().token(TOKEN).concurrent_updates(True)
@@ -362,6 +446,10 @@ def main() -> None:
 
     # --- تنظیمات Handlers ---
     
+    # دستورات عمومی
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("addadmin", add_admin_info)) # دستور جدید برای گرفتن ID
+
     # ۱. مکالمه افزودن کتاب
     add_book_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^📚 افزودن کتاب$'), add_book_start)],
@@ -392,12 +480,21 @@ def main() -> None:
         },
         fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
+    
+    # ۴. مکالمه امانت کتاب
+    borrow_book_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^🤝 امانت کتاب$'), borrow_book_start)],
+        states={
+            BORROW_GET_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), process_borrow_id)],
+        },
+        fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
+    )
 
     # افزودن تمام Handler ها به ربات
-    application.add_handler(CommandHandler("start", start))
     application.add_handler(add_book_handler)
     application.add_handler(search_book_handler)    
     application.add_handler(edit_count_handler)     
+    application.add_handler(borrow_book_handler)     
     
     # Handler برای پیام‌های ناشناخته 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
