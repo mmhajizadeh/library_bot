@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # --- توکن و تنظیمات ---
-TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbC7LnqcymMRYf8"
+TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbJcZ3LnqcymMRYf8"
 DATABASE_URL = os.environ.get('DATABASE_URL') 
 if not DATABASE_URL:
     logging.error("DATABASE_URL پیدا نشد. لطفا سرویس PostgreSQL را به پروژه متصل کنید.")
@@ -649,3 +649,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
