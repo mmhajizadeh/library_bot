@@ -1,4 +1,5 @@
-import sqlite3
+import os
+import psycopg2
 import logging
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -13,7 +14,12 @@ from telegram.ext import (
 # --- توکن و تنظیمات ---
 # توکن شما از @BotFather
 TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbJcZ3LnqcymMRYf8"
-# توجه: برای اجرای روی سرور Railway نیازی به تنظیم پراکسی نیست.
+
+# آدرس دیتابیس PostgreSQL که توسط Railway به عنوان یک متغیر محیطی تزریق می شود
+DATABASE_URL = os.environ.get('DATABASE_URL') 
+if not DATABASE_URL:
+    logging.error("DATABASE_URL پیدا نشد. لطفا سرویس PostgreSQL را به پروژه متصل کنید.")
+# -------------------------
 
 # --- فعال کردن لاگینگ ---
 logging.basicConfig(
@@ -31,15 +37,17 @@ SEARCH_QUERY = 4
 EDIT_GET_ID, EDIT_GET_NEW_COUNT = range(5, 7)
 
 
-# --- توابع کمکی دیتابیس ---
+# --- توابع کمکی دیتابیس (تغییر یافته برای PostgreSQL) ---
 
 def db_query(query, params=()):
-    """یک تابع کمکی برای اتصال و اجرای کوئری در دیتابیس"""
+    """یک تابع کمکی برای اتصال و اجرای کوئری در دیتابیس PostgreSQL"""
     conn = None
     try:
-        # دیتابیس در کنار فایل ربات روی سرور ساخته می‌شود
-        conn = sqlite3.connect('library.db', check_same_thread=False)
+        # اتصال به PostgreSQL با استفاده از متغیر محیطی
+        conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
+        
+        # در PostgreSQL از %s به جای ? استفاده می شود
         cursor.execute(query, params)
         
         if query.strip().upper().startswith("SELECT"):
@@ -47,23 +55,31 @@ def db_query(query, params=()):
             return results
         else:
             conn.commit()
-            return cursor.lastrowid
+            # در PostgreSQL، برای گرفتن آخرین ID از متد جداگانه استفاده می کنیم
+            if query.strip().upper().startswith("INSERT"):
+                # فرض می کنیم INSERT همیشه یک ID برمی گرداند
+                return "COMMIT_OK" 
+            return "COMMIT_OK"
             
-    except sqlite3.Error as e:
-        logger.error(f"خطای دیتابیس: {e} | کوئری: {query} | پارامترها: {params}")
+    except psycopg2.Error as e:
+        logger.error(f"خطای دیتابیس (PostgreSQL): {e} | کوئری: {query} | پارامترها: {params}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
             conn.close()
 
 def init_db():
-    """ایجاد جداول مورد نیاز و به‌روزرسانی ساختار جدول books"""
-    logger.info("در حال بررسی و ایجاد جداول دیتابیس...")
+    """ایجاد جداول مورد نیاز برای PostgreSQL"""
+    logger.info("در حال بررسی و ایجاد جداول دیتابیس PostgreSQL...")
     
-    # ایجاد جدول books
+    # کوئری ها باید برای سینتکس PostgreSQL بهینه شوند
+    
+    # ۱. ایجاد جدول books (استفاده از SERIAL PRIMARY KEY به جای INTEGER PRIMARY KEY)
     db_query("""
         CREATE TABLE IF NOT EXISTS books (
-            id INTEGER PRIMARY KEY,
+            id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
             author TEXT,
             subject TEXT,
@@ -71,29 +87,22 @@ def init_db():
             borrowed_count INTEGER DEFAULT 0 
         )
     """)
-    
-    # تلاش برای اضافه کردن ستون borrowed_count در صورت عدم وجود (برای جلوگیری از خطا در دیپلوی مجدد)
-    try:
-        # این کوئری فقط اگر ستون وجود نداشته باشد، آن را اضافه می‌کند.
-        db_query("ALTER TABLE books ADD COLUMN borrowed_count INTEGER DEFAULT 0")
-    except sqlite3.Error as e:
-        if "duplicate column name" in str(e):
-            pass # ستون از قبل وجود داشته، مشکلی نیست
-        else:
-            logger.error(f"خطا در اضافه کردن ستون borrowed_count: {e}")
 
-    # ایجاد جدول admins
+    # ۲. ایجاد جدول admins (user_id باید BIGINT باشد تا ID تلگرام را نگه دارد)
     db_query("""
         CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
+            user_id BIGINT PRIMARY KEY
         )
     """)
+    
+    # ۳. بررسی ادمین اولیه
     if not db_query("SELECT 1 FROM admins LIMIT 1"):
-        logger.warning("جدول ادمین خالی است. اولین کاربری که /start را بزند، ادمین خواهد شد.")
-
+        logger.warning("جدول ادمین خالی است.")
+        
 def is_admin(user_id):
     """چک می‌کند آیا کاربر ادمین است یا خیر"""
-    query = "SELECT 1 FROM admins WHERE user_id = ?"
+    # در PostgreSQL از %s برای placeholder استفاده می کنیم
+    query = "SELECT 1 FROM admins WHERE user_id = %s"
     result = db_query(query, (user_id,))
     return bool(result)
 
@@ -120,7 +129,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     # ادمین اولیه
     if not db_query("SELECT 1 FROM admins LIMIT 1"):
-        db_query("INSERT INTO admins (user_id) VALUES (?)", (user_id,))
+        # در PostgreSQL، استفاده از %s ضروری است
+        db_query("INSERT INTO admins (user_id) VALUES (%s)", (user_id,))
         logger.warning(f"کاربر {user_id} ({first_name}) به عنوان اولین ادمین ثبت شد.")
         
     welcome_text = f"سلام {first_name}، به ربات کتابخانه خوابگاه خوش آمدید!\n"
@@ -179,18 +189,36 @@ async def get_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("⚠️ خطا: موجودی باید یک عدد صحیح و بزرگتر از صفر باشد. لطفا دوباره وارد کنید:", reply_markup=ReplyKeyboardRemove())
         return GET_COUNT 
     book_data = context.user_data['book_data']
-    query = "INSERT INTO books (title, author, subject, count) VALUES (?, ?, ?, ?)"
+    
+    # کوئری PostgreSQL با %s و RETURNING id برای گرفتن ID کتاب
+    query = "INSERT INTO books (title, author, subject, count) VALUES (%s, %s, %s, %s) RETURNING id"
     params = (book_data['title'], book_data['author'], book_data['subject'], count)
-    last_id = db_query(query, params)
+    
+    # اجرای کوئری و گرفتن ID
+    conn = None
+    last_id = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        last_id = cursor.fetchone()[0]
+        conn.commit()
+    except psycopg2.Error as e:
+        logger.error(f"خطای INSERT در PostgreSQL: {e}")
+        if conn: conn.rollback()
+    finally:
+        if conn: conn.close()
+
     if last_id is not None:
         await update.message.reply_text(f"✅ کتاب **{book_data['title']}** (ID: {last_id}) با موفقیت اضافه شد.", reply_markup=get_keyboard(update.effective_user.id))
     else:
         await update.message.reply_text("❌ خطایی در ذخیره اطلاعات رخ داد.", reply_markup=get_keyboard(update.effective_user.id))
+        
     context.user_data.clear()
     return ConversationHandler.END
 
 
-# --- (بخش ۲) Handlers مربوط به جستجوی کتاب (جدید) ---
+# --- (بخش ۲) Handlers مربوط به جستجوی کتاب ---
 async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند جستجوی کتاب"""
     cancel_keyboard = [['لغو عملیات']]
@@ -203,12 +231,14 @@ async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query_text = update.message.text
     search_term = f'%{query_text}%'
     
+    # PostgreSQL: از ILIKE برای جستجوی Case-Insensitive استفاده می کنیم
     sql_query = """
         SELECT id, title, author, subject, count, borrowed_count FROM books 
-        WHERE title LIKE ? OR author LIKE ? OR subject LIKE ?
+        WHERE title ILIKE %s OR author ILIKE %s OR subject ILIKE %s
         LIMIT 10
     """
     
+    # توجه: درایور psycopg2 یک Tuple از پارامترها را انتظار دارد
     results = db_query(sql_query, (search_term, search_term, search_term))
     
     if results:
@@ -263,7 +293,7 @@ async def get_book_id_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         return EDIT_GET_ID
 
     # کتاب را پیدا کن
-    book = db_query("SELECT title, count, borrowed_count FROM books WHERE id = ?", (book_id,))
+    book = db_query("SELECT title, count, borrowed_count FROM books WHERE id = %s", (book_id,))
     if not book:
         await update.message.reply_text(f"⚠️ خطا: کتابی با ID {book_id} پیدا نشد. لطفا دوباره ID را وارد کنید:")
         return EDIT_GET_ID
@@ -293,7 +323,7 @@ async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     book_id = context.user_data['edit_book_id']
     
     # اعتبارسنجی: موجودی کل جدید نباید کمتر از تعداد قرض گرفته شده باشد
-    book_info = db_query("SELECT title, borrowed_count FROM books WHERE id = ?", (book_id,))
+    book_info = db_query("SELECT title, borrowed_count FROM books WHERE id = %s", (book_id,))
     title, borrowed_count = book_info[0] if book_info else ("N/A", 0)
     
     if new_count < borrowed_count:
@@ -304,8 +334,8 @@ async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return EDIT_GET_NEW_COUNT
 
-    # آپدیت دیتابیس
-    db_query("UPDATE books SET count = ? WHERE id = ?", (new_count, book_id))
+    # آپدیت دیتابیس (با %s)
+    db_query("UPDATE books SET count = %s WHERE id = %s", (new_count, book_id))
     
     await update.message.reply_text(
         f"✅ موجودی کل کتاب **{title}** (ID: {book_id}) با موفقیت به **{new_count}** عدد تغییر یافت.",
