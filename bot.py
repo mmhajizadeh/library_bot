@@ -1,7 +1,7 @@
 import os
 import psycopg2
 import logging
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, ForceReply
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -10,6 +10,8 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
+from collections import defaultdict
+from itertools import chain
 
 # --- توکن و تنظیمات ---
 # This token should be read from environment variables in a real application, 
@@ -32,7 +34,7 @@ GET_TITLE, GET_AUTHOR, GET_SUBJECT, GET_COUNT = range(4)
 SEARCH_QUERY = 4
 # برای ویرایش موجودی
 EDIT_GET_ID, EDIT_GET_NEW_COUNT = range(5, 7)
-# برای امانت کتاب
+# برای امانت کتاب (فقط درخواست ثبت می‌شود)
 BORROW_GET_ID = 7
 # برای بازگرداندن کتاب
 RETURN_GET_LOAN_ID = 8 
@@ -40,6 +42,10 @@ RETURN_GET_LOAN_ID = 8
 DETAILS_GET_ID = 9
 # برای حذف کتاب
 DELETE_GET_ID, DELETE_CONFIRM = range(10, 12)
+# برای مرور موضوعی (جدید)
+BROWSE_GET_SUBJECT_CHOICE = 12
+# برای تأیید/رد درخواست امانت (جدید)
+APPROVAL_GET_LOAN_ID, APPROVAL_CONFIRM_ACTION = range(13, 15)
 
 
 # --- توابع کمکی دیتابیس ---
@@ -47,7 +53,6 @@ DELETE_GET_ID, DELETE_CONFIRM = range(10, 12)
 def db_query(query, params=()):
     """یک تابع کمکی برای اتصال و اجرای کوئری در دیتابیس PostgreSQL"""
     if not DATABASE_URL:
-        # اگر DATABASE_URL تعریف نشده باشد، از اجرا جلوگیری می کند
         logger.error("خطا: DATABASE_URL در دسترس نیست. نمی‌توان به دیتابیس متصل شد.")
         return None
         
@@ -75,15 +80,14 @@ def db_query(query, params=()):
             conn.close()
 
 def init_db():
-    """ایجاد جداول مورد نیاز برای PostgreSQL"""
+    """ایجاد جداول مورد نیاز برای PostgreSQL و به‌روزرسانی ساختار (Migration)"""
     if not DATABASE_URL:
         logger.error("خطا: DATABASE_URL در دسترس نیست. جداول ایجاد نشدند.")
         return
         
     logger.info("در حال بررسی و ایجاد جداول دیتابیس PostgreSQL...")
     
-    # اطمینان از وجود تمام جداول
-    
+    # 1. جدول books
     db_query("""
         CREATE TABLE IF NOT EXISTS books (
             id SERIAL PRIMARY KEY,
@@ -95,21 +99,31 @@ def init_db():
         )
     """)
 
+    # 2. جدول admins
     db_query("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id BIGINT PRIMARY KEY
         )
     """)
     
+    # 3. جدول loans - با فیلد جدید status برای وضعیت درخواست
     db_query("""
         CREATE TABLE IF NOT EXISTS loans (
             id SERIAL PRIMARY KEY,
             book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
             user_id BIGINT NOT NULL,
             borrow_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            return_date TIMESTAMP DEFAULT NULL
+            return_date TIMESTAMP DEFAULT NULL,
+            status TEXT DEFAULT 'PENDING' 
         )
     """)
+
+    # افزودن ستون 'status' به جدول loans اگر وجود نداشته باشد (Migration)
+    # این دستور ممکن است در محیط‌های PostgreSQL قدیمی‌تر نیاز به پرمیشن‌های بیشتری داشته باشد
+    try:
+        db_query("ALTER TABLE loans ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
+    except Exception as e:
+        logger.warning(f"Failed to add 'status' column to loans table: {e}")
         
 def is_admin(user_id):
     """چک می‌کند آیا کاربر ادمین است یا خیر"""
@@ -117,21 +131,29 @@ def is_admin(user_id):
     result = db_query(query, (user_id,))
     return bool(result)
 
+def get_admin_user_ids():
+    """بازیابی لیست تمام ID های ادمین‌ها"""
+    results = db_query("SELECT user_id FROM admins")
+    return [r[0] for r in results] if results else []
+
 # --- Handlers عمومی و ناوبری ---
 
 def get_keyboard(user_id):
     """ساخت کیبورد بر اساس نقش کاربر"""
     if is_admin(user_id):
+        # اضافه شدن دکمه‌های '🏷️ مرور موضوعی' و '📩 درخواست‌های امانت'
         return ReplyKeyboardMarkup([
             ['📚 افزودن کتاب', '🔍 جستجوی کتاب'],
-            ['✏️ ویرایش موجودی', '🗑️ حذف کتاب'], # دکمه حذف جدید
-            ['🔎 جزئیات کتاب', '📦 لیست امانت‌ها'], # دکمه جزئیات جدید
+            ['✏️ ویرایش موجودی', '🗑️ حذف کتاب'], 
+            ['🔎 جزئیات کتاب', '📦 لیست امانت‌ها'], 
+            ['🏷️ مرور موضوعی', '📩 درخواست‌های امانت'] 
         ], resize_keyboard=True, one_time_keyboard=False)
     else:
+        # اضافه شدن دکمه '🏷️ مرور موضوعی'
         return ReplyKeyboardMarkup([
             ['🔍 جستجوی کتاب', '🤝 امانت کتاب'], 
             ['📕 کتاب‌های من', '↩️ بازگشت کتاب'],
-            ['🔎 جزئیات کتاب'] # دکمه جزئیات برای کاربران عادی
+            ['🔎 جزئیات کتاب', '🏷️ مرور موضوعی'] 
         ], resize_keyboard=True, one_time_keyboard=False)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -176,8 +198,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     return ConversationHandler.END
 
+# --- Handlers مربوط به افزودن، جستجو، ویرایش و حذف (بدون تغییر) ---
 
-# --- (بخش ۱) Handlers مربوط به افزودن کتاب ---
+# [Handlers for add_book_start, get_title, get_author, get_subject, get_count are unchanged]
 async def add_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند افزودن کتاب (فقط برای ادمین‌ها)"""
     user_id = update.effective_user.id
@@ -242,7 +265,7 @@ async def get_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# --- (بخش ۲) Handlers مربوط به جستجوی کتاب ---
+# [Handlers for search_start, execute_search, edit_count_start, get_book_id_for_edit, get_new_count are unchanged]
 async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند جستجوی کتاب"""
     cancel_keyboard = [['لغو عملیات']]
@@ -267,7 +290,6 @@ async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         response_text = f"✅ {len(results)} کتاب با عبارت **'{query_text}'** پیدا شد:\n\n"
         
         for book_id, title, author, subject, count, borrowed in results:
-            # Check for None in borrowed_count (though it should be 0 by default)
             borrowed = borrowed or 0
             available = count - borrowed 
             response_text += (
@@ -288,10 +310,6 @@ async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     
     return ConversationHandler.END
-
-
-# --- (بخش ۳) Handlers مربوط به ویرایش موجودی ---
-
 async def edit_count_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند ویرایش موجودی (فقط ادمین)"""
     user_id = update.effective_user.id
@@ -370,234 +388,7 @@ async def get_new_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
-# --- (بخش ۴) Handlers مربوط به امانت کتاب ---
-
-async def borrow_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """شروع فرآیند امانت کتاب"""
-    cancel_keyboard = [['لغو عملیات']]
-    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text(
-        "🤝 لطفا **ID کتابی** که می‌خواهید امانت بگیرید را وارد کنید.\n"
-        "(ID را از قسمت '🔍 جستجوی کتاب' پیدا کنید.)",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    return BORROW_GET_ID
-
-async def process_borrow_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """بررسی ID و ثبت امانت کتاب"""
-    user_id = update.effective_user.id
-    
-    try:
-        book_id = int(update.message.text)
-    except (ValueError, TypeError):
-        await update.message.reply_text("⚠️ خطا: ID کتاب باید یک عدد باشد. لطفا دوباره وارد کنید:")
-        return BORROW_GET_ID
-    
-    # 1. بازیابی اطلاعات کتاب و بررسی موجودی
-    book_info = db_query("SELECT title, count, borrowed_count FROM books WHERE id = %s", (book_id,))
-    
-    if not book_info:
-        await update.message.reply_text(f"⚠️ خطا: کتابی با ID {book_id} پیدا نشد. لطفا ID صحیح را وارد کنید:")
-        return BORROW_GET_ID
-        
-    title, total_count, borrowed_count = book_info[0]
-    borrowed_count = borrowed_count or 0 # Ensure it's not None
-    available_count = total_count - borrowed_count
-    
-    if available_count <= 0:
-        await update.message.reply_text(f"❌ متأسفانه کتاب **{title}** (ID: {book_id}) در حال حاضر موجود نیست.", reply_markup=get_keyboard(user_id), parse_mode='Markdown')
-        return ConversationHandler.END
-
-    # 2. بررسی اینکه آیا کاربر قبلاً این کتاب را امانت نگرفته است
-    loan_check_query = """
-        SELECT id FROM loans 
-        WHERE user_id = %s AND book_id = %s AND return_date IS NULL
-    """
-    existing_loan = db_query(loan_check_query, (user_id, book_id))
-    
-    if existing_loan:
-        await update.message.reply_text(
-            f"❌ شما قبلاً کتاب **{title}** را امانت گرفته‌اید و آن را برنگردانده‌اید.", 
-            reply_markup=get_keyboard(user_id),
-            parse_mode='Markdown'
-        )
-        return ConversationHandler.END
-    
-    # 3. ثبت امانت و به روز رسانی موجودی در یک تراکنش
-    conn = None
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cursor = conn.cursor()
-        
-        # A. ثبت ردیف جدید در جدول loans
-        insert_loan_query = "INSERT INTO loans (book_id, user_id) VALUES (%s, %s)"
-        cursor.execute(insert_loan_query, (book_id, user_id))
-        
-        # B. افزایش borrowed_count در جدول books
-        update_book_query = "UPDATE books SET borrowed_count = borrowed_count + 1 WHERE id = %s"
-        cursor.execute(update_book_query, (book_id,))
-        
-        conn.commit()
-        
-        await update.message.reply_text(
-            f"✅ کتاب **{title}** (ID: {book_id}) با موفقیت برای شما امانت گرفته شد.\n"
-            f"موجودی در دسترس باقیمانده: **{available_count - 1}**",
-            reply_markup=get_keyboard(user_id),
-            parse_mode='Markdown'
-        )
-        
-    except psycopg2.Error as e:
-        logger.error(f"خطا در ثبت امانت (Transaction Failed): {e}")
-        if conn: conn.rollback()
-        await update.message.reply_text("❌ خطایی در ثبت امانت رخ داد. لطفا دوباره تلاش کنید.", reply_markup=get_keyboard(user_id))
-        
-    finally:
-        if conn: conn.close()
-        context.user_data.clear()
-        return ConversationHandler.END
-
-# --- (بخش ۵) Handlers مربوط به بازگشت و لیست کتاب‌ها ---
-
-async def my_loans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """لیست کتاب‌هایی که کاربر امانت گرفته است"""
-    user_id = update.effective_user.id
-    
-    query = """
-        SELECT l.id, b.title, l.borrow_date 
-        FROM loans l
-        JOIN books b ON l.book_id = b.id
-        WHERE l.user_id = %s AND l.return_date IS NULL
-        ORDER BY l.borrow_date DESC
-    """
-    results = db_query(query, (user_id,))
-    
-    if results:
-        response_text = "📕 **کتاب‌های امانت گرفته شده توسط شما**:\n\n"
-        for loan_id, title, borrow_date in results:
-            response_text += (
-                f"**عنوان**: {title}\n"
-                f"**شماره امانت (برای بازگشت)**: `{loan_id}`\n"
-                f"**تاریخ امانت**: {borrow_date.strftime('%Y/%m/%d')}\n"
-                f"---------------------------------\n"
-            )
-        response_text += "\nبرای بازگرداندن یک کتاب، از گزینه **'↩️ بازگشت کتاب'** استفاده کنید."
-    else:
-        response_text = "✅ شما در حال حاضر هیچ کتابی را امانت نگرفته‌اید."
-        
-    await update.message.reply_text(response_text, parse_mode='Markdown', reply_markup=get_keyboard(user_id))
-
-
-async def return_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """شروع فرآیند بازگشت کتاب"""
-    cancel_keyboard = [['لغو عملیات']]
-    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text(
-        "↩️ لطفا **شماره امانت (Loan ID)** کتابی که می‌خواهید بازگردانید را وارد کنید.\n"
-        "(این شماره را می‌توانید از '📕 کتاب‌های من' پیدا کنید.)",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    return RETURN_GET_LOAN_ID
-
-async def process_return_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """دریافت Loan ID و ثبت بازگشت کتاب"""
-    user_id = update.effective_user.id
-    try:
-        loan_id = int(update.message.text)
-    except (ValueError, TypeError):
-        await update.message.reply_text("⚠️ خطا: شماره امانت باید یک عدد باشد. لطفا دوباره وارد کنید:")
-        return RETURN_GET_LOAN_ID
-
-    # 1. بررسی مالکیت و فعال بودن امانت
-    loan_info = db_query("SELECT book_id, b.title FROM loans l JOIN books b ON l.book_id = b.id WHERE l.id = %s AND l.user_id = %s AND l.return_date IS NULL", (loan_id, user_id))
-    
-    if not loan_info:
-        await update.message.reply_text(
-            f"❌ شماره امانت `{loan_id}` یا نامعتبر است، یا قبلاً بازگردانده شده است، یا به شما تعلق ندارد.\n"
-            "لطفا دوباره شماره امانت را وارد کنید:",
-            parse_mode='Markdown'
-        )
-        return RETURN_GET_LOAN_ID
-        
-    book_id, title = loan_info[0]
-
-    # 2. ثبت بازگشت و به‌روزرسانی موجودی در یک تراکنش
-    conn = None
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cursor = conn.cursor()
-        
-        # A. به‌روزرسانی return_date در جدول loans
-        update_loan_query = "UPDATE loans SET return_date = CURRENT_TIMESTAMP WHERE id = %s"
-        cursor.execute(update_loan_query, (loan_id,))
-        
-        # B. کاهش borrowed_count در جدول books
-        update_book_query = "UPDATE books SET borrowed_count = borrowed_count - 1 WHERE id = %s"
-        cursor.execute(update_book_query, (book_id,))
-        
-        conn.commit()
-        
-        await update.message.reply_text(
-            f"✅ کتاب **{title}** با موفقیت بازگردانده شد.\n"
-            "از همکاری شما متشکریم!",
-            reply_markup=get_keyboard(user_id),
-            parse_mode='Markdown'
-        )
-        
-    except psycopg2.Error as e:
-        logger.error(f"خطا در ثبت بازگشت (Transaction Failed): {e}")
-        if conn: conn.rollback()
-        await update.message.reply_text("❌ خطایی در ثبت بازگشت رخ داد. لطفا دوباره تلاش کنید.", reply_markup=get_keyboard(user_id))
-        
-    finally:
-        if conn: conn.close()
-        context.user_data.clear()
-        return ConversationHandler.END
-
-
-async def list_loans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """نمایش لیست تمام امانت‌های فعال (فقط ادمین)"""
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("شما اجازه دسترسی به این بخش را ندارید.", reply_markup=get_keyboard(user_id))
-        return 
-
-    # Query now includes user_id to display in the result
-    query = """
-        SELECT l.id, b.title, l.user_id, l.borrow_date
-        FROM loans l
-        JOIN books b ON l.book_id = b.id
-        WHERE l.return_date IS NULL
-        ORDER BY l.borrow_date ASC
-    """
-    results = db_query(query)
-    
-    if results:
-        response_text = "📦 **لیست امانت‌های فعال (بازگردانده نشده)**:\n\n"
-        for loan_id, title, borrower_id, borrow_date in results:
-            
-            # --- بهبود جدید: نمایش نام کاربری (username) ---
-            # NOTE: Telegram bot API does not easily allow fetching username from ID 
-            # unless the bot has interacted with the user recently. 
-            # We'll rely on the user ID here, but mention how to find the username.
-            
-            response_text += (
-                f"**عنوان**: {title}\n"
-                f"**شناسه امانت**: `{loan_id}`\n"
-                f"**شناسه کاربر (ID)**: `{borrower_id}`\n"
-                f"**تاریخ امانت**: {borrow_date.strftime('%Y/%m/%d')}\n"
-                f"---------------------------------\n"
-            )
-        response_text += "\nنکته: برای یافتن کاربر با استفاده از ID عددی، باید از طریق API ادمین اقدام کنید یا از لیست کاربران ربات استفاده کنید."
-    else:
-        response_text = "✅ در حال حاضر هیچ کتابی امانت گرفته نشده است."
-        
-    await update.message.reply_text(response_text, parse_mode='Markdown', reply_markup=get_keyboard(user_id))
-
-
-# --- (بخش ۶) Handlers مربوط به نمایش جزئیات کتاب (جدید) ---
-
+# [Handlers for details_start, show_details, delete_book_start, delete_get_id, delete_confirm are unchanged]
 async def details_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند نمایش جزئیات کتاب"""
     cancel_keyboard = [['لغو عملیات']]
@@ -649,10 +440,6 @@ async def show_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         parse_mode='Markdown'
     )
     return ConversationHandler.END
-
-
-# --- (بخش ۷) Handlers مربوط به حذف کتاب (جدید - فقط ادمین) ---
-
 async def delete_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """شروع فرآیند حذف کتاب (فقط ادمین)"""
     user_id = update.effective_user.id
@@ -686,10 +473,25 @@ async def delete_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     title, borrowed_count = book_info[0]
     borrowed_count = borrowed_count or 0
     
+    # علاوه بر borrowed_count، باید بررسی کنیم که آیا درخواست PENDING برای این کتاب وجود دارد یا خیر
+    pending_loans_count = db_query("SELECT COUNT(*) FROM loans WHERE book_id = %s AND status = 'PENDING'", (book_id,))
+    pending_loans_count = pending_loans_count[0][0] if pending_loans_count else 0
+
+
     if borrowed_count > 0:
         await update.message.reply_text(
             f"❌ کتاب **{title}** (ID: {book_id}) قابل حذف نیست، زیرا **{borrowed_count}** نسخه از آن در حال حاضر امانت رفته است.\n"
             "ابتدا باید تمام نسخه‌های امانت رفته بازگردانده شوند.",
+            reply_markup=get_keyboard(update.effective_user.id),
+            parse_mode='Markdown'
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    if pending_loans_count > 0:
+        await update.message.reply_text(
+            f"❌ کتاب **{title}** (ID: {book_id}) قابل حذف نیست، زیرا **{pending_loans_count}** درخواست امانت فعال (Pending) برای آن وجود دارد.\n"
+            "ابتدا باید تمام درخواست‌ها رد یا تأیید شوند.",
             reply_markup=get_keyboard(update.effective_user.id),
             parse_mode='Markdown'
         )
@@ -740,6 +542,479 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+# --- (بخش ۱: جدید) Handlers مربوط به مرور موضوعی ---
+
+async def browse_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند مرور موضوعی: دریافت لیست موضوعات"""
+    
+    # بازیابی تمام موضوعات منحصر به فرد
+    subjects_raw = db_query("SELECT DISTINCT subject FROM books WHERE subject IS NOT NULL ORDER BY subject ASC")
+    
+    if not subjects_raw:
+        await update.message.reply_text("❌ متأسفانه هنوز هیچ موضوعی در کتابخانه ثبت نشده است.", 
+                                        reply_markup=get_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+        
+    subjects = [s[0] for s in subjects_raw]
+    
+    # تقسیم موضوعات به ردیف‌های ۳ تایی برای کیبورد
+    keyboard_rows = [subjects[i:i + 3] for i in range(0, len(subjects), 3)]
+    keyboard_rows.append(['لغو عملیات'])
+    
+    reply_markup = ReplyKeyboardMarkup(keyboard_rows, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        "🏷️ لطفا یکی از **موضوعات** زیر را برای مشاهده کتاب‌ها انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+    return BROWSE_GET_SUBJECT_CHOICE
+
+async def browse_show_books(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت موضوع انتخابی و نمایش لیست کتاب‌ها"""
+    subject = update.message.text
+    
+    # بررسی کنید که موضوع انتخاب شده در واقع یکی از موضوعات دیتابیس باشد
+    subjects_check = db_query("SELECT DISTINCT subject FROM books")
+    valid_subjects = [s[0] for s in subjects_check] if subjects_check else []
+    
+    if subject not in valid_subjects:
+        await update.message.reply_text("⚠️ لطفا یک موضوع از لیست دکمه‌ها انتخاب کنید یا 'لغو عملیات' را بزنید.")
+        return BROWSE_GET_SUBJECT_CHOICE
+
+    query = """
+        SELECT id, title, author, count, borrowed_count FROM books 
+        WHERE subject = %s 
+        ORDER BY title ASC
+    """
+    results = db_query(query, (subject,))
+    
+    if results:
+        response_text = f"📚 **لیست کتاب‌ها در موضوع {subject}**:\n\n"
+        
+        for book_id, title, author, count, borrowed in results:
+            borrowed = borrowed or 0
+            available = count - borrowed 
+            response_text += (
+                f"**📕 {title}**\n"
+                f"    🆔: {book_id}\n"
+                f"    ✍️: {author}\n"
+                f"    ⬅️ موجودی: {available} (از کل {count} عدد)\n"
+                f"---------------------------------\n"
+            )
+    else:
+        # این حالت نباید رخ دهد چون موضوع از دیتابیس انتخاب شده است
+        response_text = f"❌ متأسفانه کتابی در موضوع **{subject}** پیدا نشد."
+
+    await update.message.reply_text(
+        response_text,
+        reply_markup=get_keyboard(update.effective_user.id),
+        parse_mode='Markdown'
+    )
+    
+    return ConversationHandler.END
+
+
+# --- (بخش ۲: تغییرات) Handlers مربوط به امانت کتاب (با سیستم درخواست) ---
+
+async def borrow_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند امانت کتاب"""
+    cancel_keyboard = [['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "🤝 لطفا **ID کتابی** که می‌خواهید امانت بگیرید را وارد کنید.\n"
+        "درخواست شما برای تأیید به ادمین ارسال خواهد شد.",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    return BORROW_GET_ID
+
+async def process_borrow_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """بررسی ID و ثبت درخواست امانت کتاب"""
+    user = update.effective_user
+    user_id = user.id
+    
+    try:
+        book_id = int(update.message.text)
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ خطا: ID کتاب باید یک عدد باشد. لطفا دوباره وارد کنید:")
+        return BORROW_GET_ID
+    
+    # 1. بازیابی اطلاعات کتاب و بررسی موجودی
+    book_info = db_query("SELECT title, count, borrowed_count FROM books WHERE id = %s", (book_id,))
+    
+    if not book_info:
+        await update.message.reply_text(f"⚠️ خطا: کتابی با ID {book_id} پیدا نشد. لطفا ID صحیح را وارد کنید:")
+        return BORROW_GET_ID
+        
+    title, total_count, borrowed_count = book_info[0]
+    borrowed_count = borrowed_count or 0 
+    available_count = total_count - borrowed_count
+    
+    if available_count <= 0:
+        await update.message.reply_text(f"❌ متأسفانه کتاب **{title}** (ID: {book_id}) در حال حاضر موجود نیست.", reply_markup=get_keyboard(user_id), parse_mode='Markdown')
+        return ConversationHandler.END
+
+    # 2. بررسی اینکه آیا کاربر قبلاً درخواست PENDING یا APPROVED برای این کتاب ندارد
+    loan_check_query = """
+        SELECT id, status FROM loans 
+        WHERE user_id = %s AND book_id = %s AND status IN ('PENDING', 'APPROVED')
+    """
+    existing_loan = db_query(loan_check_query, (user_id, book_id))
+    
+    if existing_loan:
+        existing_status = existing_loan[0][1]
+        if existing_status == 'APPROVED':
+            msg = f"❌ شما قبلاً کتاب **{title}** را امانت گرفته‌اید و آن را برنگردانده‌اید."
+        else: # PENDING
+            msg = f"❌ شما قبلاً درخواست امانت این کتاب (**{title}**) را ثبت کرده‌اید و در انتظار تأیید ادمین است."
+            
+        await update.message.reply_text(msg, reply_markup=get_keyboard(user_id), parse_mode='Markdown')
+        return ConversationHandler.END
+    
+    # 3. ثبت درخواست (status='PENDING')
+    conn = None
+    loan_id = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        # A. ثبت ردیف جدید در جدول loans با status='PENDING'
+        insert_loan_query = "INSERT INTO loans (book_id, user_id, status) VALUES (%s, %s, 'PENDING') RETURNING id"
+        cursor.execute(insert_loan_query, (book_id, user_id))
+        loan_id = cursor.fetchone()[0]
+        
+        conn.commit()
+        
+        # B. اطلاع‌رسانی به کاربر
+        await update.message.reply_text(
+            f"✅ درخواست امانت کتاب **{title}** (ID: {book_id}) با موفقیت ثبت شد.\n"
+            f"شماره درخواست شما: `{loan_id}`\n"
+            f"لطفا منتظر تأیید ادمین باشید.",
+            reply_markup=get_keyboard(user_id),
+            parse_mode='Markdown'
+        )
+        
+        # C. اطلاع‌رسانی به ادمین‌ها
+        admin_ids = get_admin_user_ids()
+        admin_message = (
+            f"🚨 **درخواست امانت جدید!**\n"
+            f"**عنوان کتاب**: {title} (ID: {book_id})\n"
+            f"**کاربر متقاضی**: {user.full_name} (@{user.username or 'ندارد'}) (ID: `{user_id}`)\n"
+            f"**شماره درخواست**: `{loan_id}`\n\n"
+            f"برای مدیریت، از دکمه **'📩 درخواست‌های امانت'** استفاده کنید."
+        )
+        for admin_id in admin_ids:
+             await context.bot.send_message(chat_id=admin_id, text=admin_message, parse_mode='Markdown')
+        
+    except psycopg2.Error as e:
+        logger.error(f"خطا در ثبت درخواست امانت (Transaction Failed): {e}")
+        if conn: conn.rollback()
+        await update.message.reply_text("❌ خطایی در ثبت درخواست امانت رخ داد. لطفا دوباره تلاش کنید.", reply_markup=get_keyboard(user_id))
+        
+    finally:
+        if conn: conn.close()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+
+# [My Loans and List Loans are updated to filter by status='APPROVED']
+async def my_loans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """لیست کتاب‌هایی که کاربر امانت گرفته است (فقط APPROVED)"""
+    user_id = update.effective_user.id
+    
+    query = """
+        SELECT l.id, b.title, l.borrow_date, l.status
+        FROM loans l
+        JOIN books b ON l.book_id = b.id
+        WHERE l.user_id = %s AND l.status IN ('PENDING', 'APPROVED')
+        ORDER BY l.borrow_date DESC
+    """
+    results = db_query(query, (user_id,))
+    
+    if results:
+        response_text = "📕 **وضعیت کتاب‌های شما**:\n\n"
+        for loan_id, title, borrow_date, status in results:
+            status_fa = '✅ تأیید شده (امانت فعال)' if status == 'APPROVED' else '⏳ در انتظار تأیید ادمین'
+            response_text += (
+                f"**عنوان**: {title}\n"
+                f"**شماره امانت/درخواست**: `{loan_id}`\n"
+                f"**وضعیت**: **{status_fa}**\n"
+                f"**تاریخ ثبت**: {borrow_date.strftime('%Y/%m/%d')}\n"
+                f"---------------------------------\n"
+            )
+        response_text += "\nبرای بازگرداندن کتاب (فقط موارد تأیید شده)، از گزینه **'↩️ بازگشت کتاب'** و شماره امانت آن استفاده کنید."
+    else:
+        response_text = "✅ شما در حال حاضر هیچ کتابی را امانت نگرفته‌اید یا درخواستی ندارید."
+        
+    await update.message.reply_text(response_text, parse_mode='Markdown', reply_markup=get_keyboard(user_id))
+
+
+async def return_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند بازگشت کتاب"""
+    cancel_keyboard = [['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "↩️ لطفا **شماره امانت (Loan ID)** کتابی که می‌خواهید بازگردانید را وارد کنید.\n"
+        "(این شماره برای موارد **تأیید شده** از '📕 کتاب‌های من' قابل مشاهده است.)",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    return RETURN_GET_LOAN_ID
+
+async def process_return_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت Loan ID و ثبت بازگشت کتاب"""
+    user_id = update.effective_user.id
+    try:
+        loan_id = int(update.message.text)
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ خطا: شماره امانت باید یک عدد باشد. لطفا دوباره وارد کنید:")
+        return RETURN_GET_LOAN_ID
+
+    # 1. بررسی مالکیت و فعال بودن امانت (باید APPROVED باشد)
+    loan_info = db_query("SELECT book_id, b.title, l.user_id FROM loans l JOIN books b ON l.book_id = b.id WHERE l.id = %s AND l.user_id = %s AND l.status = 'APPROVED'", (loan_id, user_id))
+    
+    if not loan_info:
+        await update.message.reply_text(
+            f"❌ شماره امانت `{loan_id}` نامعتبر است، یا قبلاً بازگردانده/رد شده است، یا تأیید نشده است، یا به شما تعلق ندارد.\n"
+            "لطفا دوباره شماره امانت را وارد کنید:",
+            parse_mode='Markdown'
+        )
+        return RETURN_GET_LOAN_ID
+        
+    book_id, title, borrower_id = loan_info[0]
+
+    # 2. ثبت بازگشت و به‌روزرسانی موجودی در یک تراکنش
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        # A. به‌روزرسانی status و return_date در جدول loans
+        update_loan_query = "UPDATE loans SET status = 'RETURNED', return_date = CURRENT_TIMESTAMP WHERE id = %s"
+        cursor.execute(update_loan_query, (loan_id,))
+        
+        # B. کاهش borrowed_count در جدول books
+        update_book_query = "UPDATE books SET borrowed_count = borrowed_count - 1 WHERE id = %s"
+        cursor.execute(update_book_query, (book_id,))
+        
+        conn.commit()
+        
+        await update.message.reply_text(
+            f"✅ کتاب **{title}** با موفقیت بازگردانده و ثبت شد.\n"
+            "از همکاری شما متشکریم!",
+            reply_markup=get_keyboard(user_id),
+            parse_mode='Markdown'
+        )
+        
+    except psycopg2.Error as e:
+        logger.error(f"خطا در ثبت بازگشت (Transaction Failed): {e}")
+        if conn: conn.rollback()
+        await update.message.reply_text("❌ خطایی در ثبت بازگشت رخ داد. لطفا دوباره تلاش کنید.", reply_markup=get_keyboard(user_id))
+        
+    finally:
+        if conn: conn.close()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+
+async def list_loans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """نمایش لیست تمام امانت‌های فعال (فقط APPROVED) (فقط ادمین)"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("شما اجازه دسترسی به این بخش را ندارید.", reply_markup=get_keyboard(user_id))
+        return 
+
+    query = """
+        SELECT l.id, b.title, l.user_id, l.borrow_date
+        FROM loans l
+        JOIN books b ON l.book_id = b.id
+        WHERE l.status = 'APPROVED'
+        ORDER BY l.borrow_date ASC
+    """
+    results = db_query(query)
+    
+    if results:
+        response_text = "📦 **لیست امانت‌های فعال (تأیید شده)**:\n\n"
+        for loan_id, title, borrower_id, borrow_date in results:
+            response_text += (
+                f"**عنوان**: {title}\n"
+                f"**شناسه امانت**: `{loan_id}`\n"
+                f"**شناسه کاربر (ID)**: `{borrower_id}`\n"
+                f"**تاریخ امانت**: {borrow_date.strftime('%Y/%m/%d')}\n"
+                f"---------------------------------\n"
+            )
+        response_text += "\nنکته: این لیست فقط موارد تأیید شده را نمایش می‌دهد. برای مدیریت درخواست‌ها، از '📩 درخواست‌های امانت' استفاده کنید."
+    else:
+        response_text = "✅ در حال حاضر هیچ کتابی به صورت فعال امانت گرفته نشده است."
+        
+    await update.message.reply_text(response_text, parse_mode='Markdown', reply_markup=get_keyboard(user_id))
+
+
+# --- (بخش ۳: جدید) Handlers مربوط به تأیید/رد درخواست امانت (فقط ادمین) ---
+
+async def approval_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """شروع فرآیند مدیریت درخواست‌ها و نمایش لیست PENDING"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("شما اجازه دسترسی به این بخش را ندارید.", reply_markup=get_keyboard(user_id))
+        return ConversationHandler.END
+
+    query = """
+        SELECT l.id, b.title, l.user_id, l.borrow_date
+        FROM loans l
+        JOIN books b ON l.book_id = b.id
+        WHERE l.status = 'PENDING'
+        ORDER BY l.borrow_date ASC
+    """
+    results = db_query(query)
+    
+    if not results:
+        await update.message.reply_text("✅ در حال حاضر هیچ درخواست امانت جدیدی در انتظار تأیید نیست.", 
+                                        reply_markup=get_keyboard(user_id))
+        return ConversationHandler.END
+        
+    response_text = "📩 **درخواست‌های امانت در انتظار تأیید**:\n\n"
+    for loan_id, title, borrower_id, borrow_date in results:
+        response_text += (
+            f"**عنوان**: {title}\n"
+            f"**شماره درخواست**: `{loan_id}`\n"
+            f"**ID کاربر متقاضی**: `{borrower_id}`\n"
+            f"**تاریخ درخواست**: {borrow_date.strftime('%Y/%m/%d')}\n"
+            f"---------------------------------\n"
+        )
+    
+    cancel_keyboard = [['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+    await update.message.reply_text(
+        response_text + "\nلطفا **شماره درخواستی (Loan ID)** که می‌خواهید تأیید یا رد کنید را وارد نمایید:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    return APPROVAL_GET_LOAN_ID
+
+async def approval_get_loan_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت Loan ID و درخواست اقدام (تأیید/رد)"""
+    try:
+        loan_id = int(update.message.text)
+    except (ValueError, TypeError):
+        await update.message.reply_text("⚠️ خطا: شماره درخواست باید یک عدد باشد. لطفا دوباره وارد کنید:")
+        return APPROVAL_GET_LOAN_ID
+        
+    loan_info = db_query("""
+        SELECT l.user_id, b.title, b.id 
+        FROM loans l 
+        JOIN books b ON l.book_id = b.id 
+        WHERE l.id = %s AND l.status = 'PENDING'
+    """, (loan_id,))
+    
+    if not loan_info:
+        await update.message.reply_text(f"⚠️ خطا: درخواست `{loan_id}` پیدا نشد یا قبلاً مدیریت شده است. لطفا شماره صحیح را وارد کنید:")
+        return APPROVAL_GET_LOAN_ID
+
+    borrower_id, title, book_id = loan_info[0]
+    
+    context.user_data['manage_loan_id'] = loan_id
+    context.user_data['manage_book_id'] = book_id
+    context.user_data['manage_borrower_id'] = borrower_id
+
+    confirm_keyboard = [['✅ تأیید امانت', '❌ رد درخواست'], ['لغو عملیات']]
+    reply_markup = ReplyKeyboardMarkup(confirm_keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        f"✅ درخواست شماره `{loan_id}` برای کتاب **{title}** توسط کاربر `{borrower_id}` انتخاب شد.\n"
+        f"لطفا اقدام مورد نظر را انتخاب کنید:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    return APPROVAL_CONFIRM_ACTION
+
+async def approval_confirm_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """اجرای تأیید یا رد درخواست"""
+    action = update.message.text
+    loan_id = context.user_data.get('manage_loan_id')
+    book_id = context.user_data.get('manage_book_id')
+    borrower_id = context.user_data.get('manage_borrower_id')
+    
+    if action == '✅ تأیید امانت':
+        
+        # 1. بررسی نهایی موجودی (برای جلوگیری از شرایط مسابقه)
+        book_availability = db_query("SELECT count, borrowed_count, title FROM books WHERE id = %s", (book_id,))
+        total, borrowed, title = book_availability[0]
+        if total - (borrowed or 0) <= 0:
+            await update.message.reply_text(
+                f"❌ تأیید نشد: کتاب **{title}** دیگر موجودی در دسترس ندارد. شاید یک ادمین دیگر آن را تأیید کرده باشد.",
+                reply_markup=get_keyboard(update.effective_user.id),
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+
+        # 2. اجرای تراکنش تأیید
+        conn = None
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            
+            # A. به‌روزرسانی status در loans به APPROVED
+            cursor.execute("UPDATE loans SET status = 'APPROVED' WHERE id = %s", (loan_id,))
+            
+            # B. افزایش borrowed_count در books
+            cursor.execute("UPDATE books SET borrowed_count = borrowed_count + 1 WHERE id = %s", (book_id,))
+            
+            conn.commit()
+
+            # اطلاع‌رسانی به ادمین
+            await update.message.reply_text(
+                f"✅ درخواست `{loan_id}` برای کتاب **{title}** با موفقیت **تأیید** شد.\n"
+                f"کاربر `{borrower_id}` مطلع شد.",
+                reply_markup=get_keyboard(update.effective_user.id),
+                parse_mode='Markdown'
+            )
+            
+            # اطلاع‌رسانی به کاربر متقاضی
+            await context.bot.send_message(
+                chat_id=borrower_id, 
+                text=f"🥳 خبر خوب! درخواست امانت شما برای کتاب **{title}** (ID: {book_id}) توسط ادمین **تأیید** شد.\n"
+                     f"شما می‌توانید کتاب را دریافت کنید. لطفا در اسرع وقت اقدام به دریافت کنید.",
+                parse_mode='Markdown'
+            )
+            
+        except psycopg2.Error as e:
+            logger.error(f"خطا در تأیید امانت (Transaction Failed): {e}")
+            if conn: conn.rollback()
+            await update.message.reply_text("❌ خطایی در هنگام تأیید درخواست رخ داد.", reply_markup=get_keyboard(update.effective_user.id))
+        finally:
+            if conn: conn.close()
+            
+    elif action == '❌ رد درخواست':
+        # 1. اجرای رد درخواست
+        db_query("UPDATE loans SET status = 'REJECTED', return_date = CURRENT_TIMESTAMP WHERE id = %s", (loan_id,))
+        
+        # اطلاع‌رسانی به ادمین
+        await update.message.reply_text(
+            f"❌ درخواست `{loan_id}` برای کتاب **{context.user_data.get('manage_book_title', 'این کتاب')}** **رد** شد.\n"
+            f"کاربر `{borrower_id}` مطلع شد.",
+            reply_markup=get_keyboard(update.effective_user.id),
+            parse_mode='Markdown'
+        )
+        
+        # اطلاع‌رسانی به کاربر متقاضی
+        await context.bot.send_message(
+            chat_id=borrower_id, 
+            text=f"😞 متأسفیم. درخواست امانت شما برای کتاب **{context.user_data.get('manage_book_title', 'این کتاب')}** (ID: {book_id}) توسط ادمین **رد** شد.",
+            parse_mode='Markdown'
+        )
+
+    else:
+        # لغو عملیات
+        await update.message.reply_text(
+            "❌ عملیات مدیریت درخواست امانت لغو شد.", 
+            reply_markup=get_keyboard(update.effective_user.id)
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
 # --- تابع اصلی ---
 
 def main() -> None:
@@ -782,8 +1057,18 @@ def main() -> None:
         },
         fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
+    
+    # ۳. مکالمه مرور موضوعی (جدید)
+    browse_subject_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^🏷️ مرور موضوعی$'), browse_start)],
+        states={
+            BROWSE_GET_SUBJECT_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), browse_show_books)],
+        },
+        fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
+    )
 
-    # ۳. مکالمه ویرایش موجودی
+
+    # ۴. مکالمه ویرایش موجودی
     edit_count_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^✏️ ویرایش موجودی$'), edit_count_start)],
         states={
@@ -793,7 +1078,7 @@ def main() -> None:
         fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
     
-    # ۴. مکالمه امانت کتاب
+    # ۵. مکالمه امانت کتاب (درخواست)
     borrow_book_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^🤝 امانت کتاب$'), borrow_book_start)],
         states={
@@ -802,7 +1087,7 @@ def main() -> None:
         fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
     
-    # ۵. مکالمه بازگشت کتاب
+    # ۶. مکالمه بازگشت کتاب
     return_book_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^↩️ بازگشت کتاب$'), return_book_start)],
         states={
@@ -811,7 +1096,7 @@ def main() -> None:
         fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
     
-    # ۶. مکالمه نمایش جزئیات کتاب (جدید)
+    # ۷. مکالمه نمایش جزئیات کتاب
     details_book_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^🔎 جزئیات کتاب$'), details_start)],
         states={
@@ -820,12 +1105,22 @@ def main() -> None:
         fallbacks=[MessageHandler(filters.Regex('^لغو عملیات$') | filters.COMMAND, cancel)]
     )
     
-    # ۷. مکالمه حذف کتاب (جدید)
+    # ۸. مکالمه حذف کتاب
     delete_book_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^🗑️ حذف کتاب$'), delete_book_start)],
         states={
             DELETE_GET_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), delete_get_id)],
             DELETE_CONFIRM: [MessageHandler(filters.Regex('^بله، حذف کن$|^لغو عملیات$'), delete_confirm)],
+        },
+        fallbacks=[MessageHandler(filters.COMMAND | filters.Regex('^لغو عملیات$'), cancel)]
+    )
+    
+    # ۹. مکالمه مدیریت درخواست‌های امانت (جدید)
+    approval_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^📩 درخواست‌های امانت$'), approval_start)],
+        states={
+            APPROVAL_GET_LOAN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^لغو عملیات$'), approval_get_loan_id)],
+            APPROVAL_CONFIRM_ACTION: [MessageHandler(filters.Regex('^✅ تأیید امانت$|^❌ رد درخواست$|^لغو عملیات$'), approval_confirm_action)],
         },
         fallbacks=[MessageHandler(filters.COMMAND | filters.Regex('^لغو عملیات$'), cancel)]
     )
@@ -839,11 +1134,13 @@ def main() -> None:
     # افزودن تمام Handler ها به ربات
     application.add_handler(add_book_handler)
     application.add_handler(search_book_handler)    
+    application.add_handler(browse_subject_handler)
     application.add_handler(edit_count_handler)     
     application.add_handler(borrow_book_handler)     
     application.add_handler(return_book_handler) 
     application.add_handler(details_book_handler)
     application.add_handler(delete_book_handler)
+    application.add_handler(approval_handler)
     
     # Handler برای پیام‌های ناشناخته 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
@@ -855,4 +1152,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
