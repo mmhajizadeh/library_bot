@@ -14,7 +14,7 @@ from telegram.ext import (
 # --- توکن و تنظیمات ---
 # This token should be read from environment variables in a real application, 
 # but for this example, we keep it here.
-TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbC7LnqcymMRYf8"
+TOKEN = "8548212605:AAHqcczpKhO9YUcJyiQbJcZ3LnqcymMRYf8"
 DATABASE_URL = os.environ.get('DATABASE_URL') 
 # -------------------------
 
@@ -855,3 +855,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
